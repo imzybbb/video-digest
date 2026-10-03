@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+vd_out/
+models/
+*.mp4
+*.wav
+frames/
+*.log
