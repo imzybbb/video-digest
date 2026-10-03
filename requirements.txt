@@ -2,3 +2,4 @@ requests
 faster-whisper
 yt-dlp
 numpy
+f2

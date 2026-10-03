@@ -1,30 +1,35 @@
 # -*- coding: utf-8 -*-
-"""vd.py — 视频解读流水线（B站）
+"""vd.py — 视频解读流水线（B站 + 抖音）
 
-把一条 B站视频链接变成结构化"解读卡"素材：
-  元数据 -> 视频下载(yt-dlp) -> 语音转写(faster-whisper) ->
-  抽帧 + 画面描述(Ollama 视觉模型，可选) -> 热门评论 -> 弹幕统计 -> report.md
+把一条视频链接变成结构化"解读卡"素材：
+  平台识别 -> 下载 -> 语音转写(faster-whisper) -> 抽帧/图文视觉描述(Ollama 可选) ->
+  (B站)评论+弹幕 -> report.md
 
 用法:
-  python vd.py <url> [--out DIR] [--frames 12] [--lang zh] [--max-min 0]
-                    [--model <whisper模型名或路径>] [--no-vision] [--no-dl]
+  python vd.py <url或分享文案> [--out DIR] [--frames 12] [--lang zh] [--max-min 0]
+                [--model <whisper模型名或路径>] [--no-vision]
 
 环境变量:
   VD_OUT          输出根目录（默认 ./vd_out）
   VD_MODEL        whisper 模型名或路径（默认 large-v3-turbo）
   VD_VISION_MODEL Ollama 视觉模型名（默认 qwen3-vl:8b，找不到时自动挑含 "vl" 的）
   VD_OLLAMA       Ollama 地址（默认 http://127.0.0.1:11434）
+  VD_DY_COOKIE    抖音 cookie 文件路径（默认 <repo>/dy_cookie.txt，见 get_dy_cookie.py）
+
+抖音说明：下载走 f2 引擎，必须提供登录 cookie（见 README「抖音的一次性准备」）。
 """
-import argparse, base64, json, os, re, subprocess, sys, zlib
+import argparse, base64, glob, json, os, re, shutil, subprocess, sys, time, zlib
 import requests
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
       "Referer": "https://www.bilibili.com/"}
+MOBILE_UA = {"User-Agent": "Mozilla/5.0 (Linux; Android 11; SAMSUNG SM-G973U) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/14.2 Chrome/87.0.4280.141 Mobile Safari/537.36"}
 PY = sys.executable
 MODEL = os.environ.get("VD_MODEL", "")
 OLLAMA = os.environ.get("VD_OLLAMA", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.environ.get("VD_VISION_MODEL", "qwen3-vl:8b")
 WORK = os.environ.get("VD_OUT", "vd_out")
+DY_COOKIE = os.environ.get("VD_DY_COOKIE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dy_cookie.txt"))
 
 
 def log(*a):
@@ -35,6 +40,8 @@ def jdump(obj, path):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
+
+# ================= B站 =================
 
 def resolve_url(url):
     if "b23.tv" in url:
@@ -156,7 +163,7 @@ def extract_frames(video, outdir, n=12):
     return frames
 
 
-def vision(frames, outdir, enabled=True):
+def vision(frames, outdir, enabled=True, prompt=None):
     vj = os.path.join(outdir, "frame_desc.json")
     if os.path.exists(vj):
         log("视觉描述已存在，跳过")
@@ -184,8 +191,11 @@ def vision(frames, outdir, enabled=True):
                 b64 = base64.b64encode(open(fp, "rb").read()).decode()
                 resp = requests.post(f"{OLLAMA}/api/generate", json={
                     "model": use_model,
-                    "prompt": "这是一段视频的截图。用1-2句中文描述画面内容（人物/物体/场景/动作）；如果画面里有字幕或文字，原文照录。",
-                    "images": [b64], "stream": False}, timeout=180).json()
+                    "prompt": prompt or "这是一段视频的截图。用1-2句中文描述画面内容（人物/物体/场景/动作）；如果画面里有字幕或文字，原文照录。",
+                    "images": [b64], "stream": False,
+                    "options": {"num_ctx": 16384, "num_predict": 400}}, timeout=180).json()
+                if resp.get("error"):
+                    raise RuntimeError(str(resp["error"])[:140])
                 out.append({"t": t, "desc": (resp.get("response") or "").strip()[:400]})
                 log(f"视觉 {t}s ok")
             except Exception as e:
@@ -205,7 +215,7 @@ def get_comments(aid, outdir):
     s = requests.Session()
     s.headers.update(UA)
     try:
-        s.get("https://www.bilibili.com/", timeout=20)  # 种 buvid3 等 cookie
+        s.get("https://www.bilibili.com/", timeout=20)
         spi = s.get("https://api.bilibili.com/x/frontend/finger/spi", timeout=20).json()
         d = spi.get("data") or {}
         if d.get("b_3"):
@@ -334,8 +344,152 @@ def build_report(meta, page, outdir, tr, frames, vd, comments, danmaku):
     return rp
 
 
+# ================= 抖音（f2 引擎）=================
+
+def find_douyin_url(text):
+    for m in re.finditer(r"https?://[^\s\u4e00-\u9fff\"'<>]+", text or ""):
+        u = m.group(0).rstrip("，。！？,.;)）】]")
+        if "douyin" in u:
+            return u
+    m = re.search(r"(v\.douyin\.com/[A-Za-z0-9_\-]+)", text or "")
+    if m:
+        return "https://" + m.group(1)
+    return None
+
+
+def resolve_dy(url):
+    final = url
+    try:
+        r = requests.get(url, headers=MOBILE_UA, allow_redirects=True, timeout=20)
+        final = r.url
+    except Exception as e:
+        log("短链解析异常（用原链继续）:", repr(e)[:80])
+    m = re.search(r"/(?:video|note|slides)/(\d+)", final) or re.search(r"/(\d{15,})", final)
+    aid = m.group(1) if m else None
+    typ = "note" if ("/note/" in final or "/slides/" in final) else "video"
+    return final, aid, typ
+
+
+def _dy_media(f2dir):
+    mp4 = glob.glob(os.path.join(f2dir, "**", "*.mp4"), recursive=True)
+    mp4.sort(key=os.path.getsize, reverse=True)
+    imgs = [p for p in glob.glob(os.path.join(f2dir, "**", "*"), recursive=True)
+            if os.path.splitext(p)[1].lower() in (".jpg", ".jpeg", ".png", ".webp")]
+    imgs.sort()
+    return mp4, imgs
+
+
+def fetch_douyin(url, outdir):
+    f2dir = os.path.join(outdir, "f2")
+    os.makedirs(f2dir, exist_ok=True)
+    mp4, imgs = _dy_media(f2dir)
+    if not mp4 and not imgs:
+        cookie = ""
+        if os.path.exists(DY_COOKIE):
+            cookie = open(DY_COOKIE, encoding="utf-8").read().strip()
+        cmd = [PY, "-m", "f2", "dy", "-M", "one", "-u", url, "-p", f2dir, "-d", "true"]
+        if cookie:
+            cmd += ["-k", cookie]
+        log("抖音下载中（f2）...")
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=900)
+        except subprocess.TimeoutExpired:
+            raise SystemExit("抖音下载超时")
+        mp4, imgs = _dy_media(f2dir)
+        if not mp4 and not imgs:
+            tail = ((r.stdout or "") + "\n" + (r.stderr or ""))[-500:]
+            raise SystemExit("抖音下载失败（检查 dy_cookie.txt 是否有效）:\n" + tail)
+    video = mp4[0] if mp4 else ""
+    src = video or (imgs[0] if imgs else "")
+    author = ""
+    parts = src.replace("\\", "/").split("/")
+    for i, p in enumerate(parts):
+        if p == "one" and i + 1 <= len(parts) - 2:
+            author = parts[i + 1]
+            break
+    descs = glob.glob(os.path.join(f2dir, "**", "*_desc.txt"), recursive=True)
+    caption = ""
+    if descs:
+        caption = open(descs[0], encoding="utf-8", errors="replace").read().strip()
+    title = ""
+    base = os.path.basename(src) if src else ""
+    m = re.match(r"\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2}_(.*?)(?:_video|_image_\d+)?\.[A-Za-z0-9]+$", base)
+    if m:
+        title = m.group(1)
+    return {"video": video, "images": imgs, "caption": caption, "author": author,
+            "title": title or caption[:60]}
+
+
+def douyin_flow(text, out_root, frames_n=12, vision_on=True, model_src="", lang="zh"):
+    url = find_douyin_url(text) or text
+    final, aid, typ = resolve_dy(url)
+    key = "dy" + (aid or time.strftime("%Y%m%d_%H%M%S"))
+    outdir = os.path.join(out_root, key)
+    os.makedirs(outdir, exist_ok=True)
+    log(f"抖音作品: id={aid or '?'} 类型={typ} | {final[:90]}")
+    info = fetch_douyin(url, outdir)
+    jdump(info, os.path.join(outdir, "dy_meta.json"))
+    tr = None
+    if info["video"]:
+        audio = extract_audio(info["video"], outdir)
+        tr = transcribe(audio, outdir, model_src, lang)
+        frames = extract_frames(info["video"], outdir, frames_n)
+        vd = vision(frames, outdir, enabled=vision_on)
+    else:
+        imgs = info["images"]
+        fdir = os.path.join(outdir, "frames")
+        os.makedirs(fdir, exist_ok=True)
+        fl = []
+        for i, p in enumerate(imgs[:frames_n]):
+            # 统一转 JPEG（抖音图片常为 webp，Ollama 不支持）
+            dst = os.path.join(fdir, f"img{i + 1:02d}.jpg")
+            if not os.path.exists(dst):
+                subprocess.run(["ffmpeg", "-y", "-i", p, "-q:v", "3", dst], capture_output=True)
+                if not (os.path.exists(dst) and os.path.getsize(dst) > 512):
+                    shutil.copy(p, dst)
+            fl.append((i + 1, dst))
+        log(f"图文作品: {len(imgs)} 张图（前 {len(fl)} 张做视觉描述）")
+        vd = vision(fl, outdir, enabled=vision_on,
+                    prompt="这是一条图文作品的图片之一。用1-2句中文描述画面内容（人物/场景/物品/穿搭）；如果画面里有文字，原文照录。")
+    rp = build_report_dy(info, aid, outdir, tr, vd)
+    log(f"VD_DONE {outdir}")
+    print("REPORT:", rp)
+
+
+def build_report_dy(info, aid, outdir, tr, vd):
+    is_video = bool(info.get("video"))
+    lines = []
+    lines.append(f"# 抖音{'视频' if is_video else '图文'}解读素材：{info.get('title') or aid}")
+    lines.append(f"- 作者: {info.get('author') or '?'} | 链接: https://www.douyin.com/{'video' if is_video else 'note'}/{aid or '?'}")
+    if info.get("caption"):
+        lines.append(f"- 文案: {info['caption'][:500]}")
+    lines.append("")
+    if tr:
+        lines.append("## 音频转写（语音内容）")
+        for s in tr["segments"]:
+            mm, ss = divmod(int(s["t"]), 60)
+            lines.append(f"[{mm:02d}:{ss:02d}] {s['text']}")
+        lines.append("")
+    lines.append("## 画面描述" + ("（抽帧）" if is_video else "（图片逐张）"))
+    for v in vd:
+        if is_video:
+            mm, ss = divmod(int(v["t"]), 60)
+            lines.append(f"[{mm:02d}:{ss:02d}] {v['desc']}")
+        else:
+            lines.append(f"[图{int(v['t']):02d}] {v['desc']}")
+    lines.append("")
+    lines.append("## 备注")
+    lines.append("- 抖音无弹幕；评论区暂未接入（后续版本）")
+    rp = os.path.join(outdir, "report.md")
+    with open(rp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    log("报告生成:", rp)
+    return rp
+
+
 def main():
-    ap = argparse.ArgumentParser(description="视频解读流水线（B站）")
+    ap = argparse.ArgumentParser(description="视频解读流水线（B站 + 抖音）")
     ap.add_argument("url")
     ap.add_argument("--out", default=WORK)
     ap.add_argument("--frames", type=int, default=12)
@@ -343,13 +497,18 @@ def main():
     ap.add_argument("--lang", default="zh")
     ap.add_argument("--model", default=MODEL, help="whisper 模型名或本地路径（默认 large-v3-turbo）")
     ap.add_argument("--no-vision", action="store_true")
-    ap.add_argument("--no-dl", action="store_true", help="跳过下载（要求输出目录已有 video.mp4）")
     args = ap.parse_args()
 
-    url = resolve_url(args.url)
+    target = args.url.strip()
+    if "douyin" in target:
+        douyin_flow(target, args.out, frames_n=args.frames, vision_on=not args.no_vision,
+                    model_src=args.model, lang=args.lang)
+        return
+
+    url = resolve_url(target)
     bvid, av, page = parse_ids(url)
     if not bvid and not av:
-        raise SystemExit("无法识别 B 站视频链接: " + url)
+        raise SystemExit("无法识别视频链接: " + url)
     meta = get_meta(bvid, av)
     pages = meta.get("pages") or []
     pg = pages[page - 1] if 0 < page <= len(pages) else pages[0]
@@ -360,12 +519,7 @@ def main():
     jdump(meta, os.path.join(outdir, "meta.json"))
     log(f"视频: {meta.get('title')} | {len(pages)}P | 使用 P{page} cid={cid}")
 
-    if args.no_dl:
-        video = os.path.join(outdir, "video.mp4")
-        if not os.path.exists(video):
-            raise SystemExit("--no-dl 指定了跳过下载，但输出目录没有 video.mp4")
-    else:
-        video = download(url, outdir, args.max_min)
+    video = download(url, outdir, args.max_min)
     audio = extract_audio(video, outdir)
     tr = transcribe(audio, outdir, args.model, args.lang)
     frames = extract_frames(video, outdir, args.frames)

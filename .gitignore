@@ -6,3 +6,4 @@ models/
 *.wav
 frames/
 *.log
+dy_cookie.txt
