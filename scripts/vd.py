@@ -166,8 +166,13 @@ def extract_frames(video, outdir, n=12):
 def vision(frames, outdir, enabled=True, prompt=None):
     vj = os.path.join(outdir, "frame_desc.json")
     if os.path.exists(vj):
-        log("视觉描述已存在，跳过")
-        return json.load(open(vj, encoding="utf-8"))
+        try:
+            prev = json.load(open(vj, encoding="utf-8"))
+        except Exception:
+            prev = []
+        if prev:
+            log("视觉描述已存在，跳过")
+            return prev
     out = []
     if not enabled:
         jdump(out, vj)
@@ -201,7 +206,8 @@ def vision(frames, outdir, enabled=True, prompt=None):
             except Exception as e:
                 out.append({"t": t, "desc": f"[失败] {repr(e)[:80]}"})
                 log(f"视觉 {t}s 失败", repr(e)[:120])
-    jdump(out, vj)
+    if ollama_ok:
+        jdump(out, vj)
     return out
 
 
