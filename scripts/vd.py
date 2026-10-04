@@ -163,6 +163,50 @@ def extract_frames(video, outdir, n=12):
     return frames
 
 
+_started_ollama = [False]   # 记录 Ollama 是否由本脚本拉起（列表以便函数内修改）
+
+
+def _ensure_ollama():
+    """确保 Ollama 在运行（不在则尝试拉起）"""
+    try:
+        requests.get(f"{OLLAMA}/api/tags", timeout=4)
+        return True
+    except Exception:
+        pass
+    log("Ollama 未运行，尝试自动拉起 ...")
+    try:
+        flags = 0x08000000 if os.name == "nt" else 0
+        subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, creationflags=flags)
+    except Exception as e:
+        log("拉起 Ollama 失败:", repr(e)[:100])
+        return False
+    for _ in range(20):
+        time.sleep(1)
+        try:
+            requests.get(f"{OLLAMA}/api/tags", timeout=3)
+            _started_ollama[0] = True
+            log("Ollama 已拉起 ✓")
+            return True
+        except Exception:
+            pass
+    log("Ollama 拉起超时（20s）")
+    return False
+
+
+def _shutdown_ollama():
+    """任务结束：仅停本脚本拉起的 Ollama，保持"不用就停" """
+    if not _started_ollama[0]:
+        return
+    log("任务完成，停掉本脚本拉起的 Ollama ...")
+    for img in ("ollama app.exe", "ollama.exe", "ollama_llama_server.exe"):
+        try:
+            subprocess.run(["taskkill", "/IM", img, "/F"], capture_output=True, timeout=15)
+        except Exception:
+            pass
+    _started_ollama[0] = False
+
+
 def vision(frames, outdir, enabled=True, prompt=None):
     vj = os.path.join(outdir, "frame_desc.json")
     if os.path.exists(vj):
@@ -180,12 +224,15 @@ def vision(frames, outdir, enabled=True, prompt=None):
     ollama_ok = False
     names = []
     try:
-        tags = requests.get(f"{OLLAMA}/api/tags", timeout=5).json()
-        names = [m["name"] for m in tags.get("models", [])]
-        ollama_ok = True
-        log("Ollama 模型:", ", ".join(names[:6]))
+        if _ensure_ollama():
+            tags = requests.get(f"{OLLAMA}/api/tags", timeout=5).json()
+            names = [m["name"] for m in tags.get("models", [])]
+            ollama_ok = True
+            log("Ollama 模型:", ", ".join(names[:6]))
+        else:
+            log("Ollama 不可用，跳过画面描述")
     except Exception as e:
-        log("Ollama 未运行，跳过画面描述:", repr(e)[:100])
+        log("Ollama 状态异常，跳过画面描述:", repr(e)[:100])
     if ollama_ok:
         use_model = OLLAMA_MODEL
         if use_model not in names:
@@ -208,6 +255,11 @@ def vision(frames, outdir, enabled=True, prompt=None):
                 log(f"视觉 {t}s 失败", repr(e)[:120])
     if ollama_ok:
         jdump(out, vj)
+        try:  # 用完立刻卸载模型（不占显存/内存）
+            requests.post(f"{OLLAMA}/api/generate", json={"model": use_model, "keep_alive": 0}, timeout=10)
+            log("视觉模型已卸载（不用即释放）")
+        except Exception:
+            pass
     return out
 
 
@@ -461,6 +513,7 @@ def douyin_flow(text, out_root, frames_n=12, vision_on=True, model_src="", lang=
     rp = build_report_dy(info, aid, outdir, tr, vd)
     log(f"VD_DONE {outdir}")
     print("REPORT:", rp)
+    _shutdown_ollama()
 
 
 def build_report_dy(info, aid, outdir, tr, vd):
@@ -509,6 +562,7 @@ def main():
     if "douyin" in target:
         douyin_flow(target, args.out, frames_n=args.frames, vision_on=not args.no_vision,
                     model_src=args.model, lang=args.lang)
+        _shutdown_ollama()
         return
 
     url = resolve_url(target)
@@ -535,6 +589,7 @@ def main():
     rp = build_report(meta, page, outdir, tr, frames, vd, comments, danmaku)
     log(f"VD_DONE {outdir}")
     print("REPORT:", rp)
+    _shutdown_ollama()
 
 
 if __name__ == "__main__":
